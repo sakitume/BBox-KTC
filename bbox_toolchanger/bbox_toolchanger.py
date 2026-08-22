@@ -123,7 +123,10 @@ class BBoxToolChangerProxy:
         self.impl.BT_STATS(gcmd)
 
     def cmd_BT_SAVE_TOOL_OFFSET(self, gcmd):
-        self.impl.BT_SAVE_TOOL_OFFSET(gcmd)
+        try:
+            self.impl.BT_SAVE_TOOL_OFFSET(gcmd)
+        except Exception as e:
+            self.log_exception(e)
 
     def cmd_BT_CALIBRATE_DOCK(self, gcmd):
         try:

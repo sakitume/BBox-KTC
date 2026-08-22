@@ -60,6 +60,11 @@ BT_SOFTWARE_DIR="${CONFIG_PATH}/bbox_toolchanger"
 BT_USER_CONFIG_DIR="${CONFIG_PATH}/bt_config"
 UI_DEST="${CONFIG_PATH}/bbox-ui"
 NGINX_CONF="/etc/nginx/sites-enabled/mainsail"
+# Deliberately NOT sites-enabled/ itself: Debian's nginx.conf includes
+# sites-enabled/* with a bare glob (no extension filter), so a .bak file left
+# in place there gets loaded as its own server block too - duplicating
+# `listen 80 default_server` and breaking `nginx -t` until it's removed.
+NGINX_BACKUP_DIR="/etc/nginx"
 MOONRAKER_CONF="${CONFIG_PATH}/moonraker.conf"
 
 PRINTER_CFG_BEGIN="#--[ Begin: BBox Toolchanger config files ]"
@@ -269,7 +274,9 @@ function install_examples {
         else
             cp "$src" "$dest"
             echo "[INSTALL] Created $dest - edit it for your printer."
-            [ "$name" = "bt_customize.cfg" ] && BT_CUSTOMIZE_JUST_CREATED=true
+            if [ "$name" = "bt_customize.cfg" ]; then
+                BT_CUSTOMIZE_JUST_CREATED=true
+            fi
         fi
     done
 }
@@ -356,8 +363,12 @@ function offer_nginx_patch {
 
     if ask_yes_no "[NGINX] Add it now (backs up the file first)? [y/N] " "n"; then
         local backup tmpfile
-        backup="${NGINX_CONF}.bak-$(date +%Y%m%d-%H%M%S)"
-        cp "$NGINX_CONF" "$backup"
+        backup="$NGINX_BACKUP_DIR/$(basename "$NGINX_CONF").bak-$(date +%Y%m%d-%H%M%S)"
+        if ! sudo cp "$NGINX_CONF" "$backup"; then
+            echo "${C_RED}[ERROR]${C_RESET} Could not back up $NGINX_CONF (sudo failed - a password may be required, which won't work non-interactively)."
+            print_nginx_instructions
+            return
+        fi
         echo "[NGINX] Backed up to $backup"
 
         tmpfile="$(mktemp)"
@@ -403,8 +414,11 @@ function offer_remove_nginx_block {
     fi
 
     local backup tmpfile
-    backup="${NGINX_CONF}.bak-$(date +%Y%m%d-%H%M%S)"
-    cp "$NGINX_CONF" "$backup"
+    backup="$NGINX_BACKUP_DIR/$(basename "$NGINX_CONF").bak-$(date +%Y%m%d-%H%M%S)"
+    if ! sudo cp "$NGINX_CONF" "$backup"; then
+        echo "${C_RED}[ERROR]${C_RESET} Could not back up $NGINX_CONF (sudo failed - a password may be required, which won't work non-interactively)."
+        return
+    fi
     echo "[NGINX] Backed up to $backup"
 
     tmpfile="$(mktemp)"
@@ -469,7 +483,7 @@ function offer_moonraker_patch {
     moonraker_block
     echo ""
 
-    if ask_yes_no "[MOONRAKER] Add it now (backs up the file first)? [y/N] " "n"; then
+    if ask_yes_no "[MOONRAKER] Add it now (backs up the file first)? [Y/n] " "y"; then
         local backup
         backup="${MOONRAKER_CONF}.bak-$(date +%Y%m%d-%H%M%S)"
         cp "$MOONRAKER_CONF" "$backup"
@@ -571,10 +585,14 @@ function offer_printer_cfg_patch {
     fi
 
     local have_base=0 have_utils=0 have_customize=0 have_section=0
-    grep -qE '^\s*\[include\s+bbox_toolchanger/bt_base\.cfg\]' "$printer_cfg" 2>/dev/null && have_base=1
-    grep -qE '^\s*\[include\s+bbox_toolchanger/bt_utils\.cfg\]' "$printer_cfg" 2>/dev/null && have_utils=1
-    grep -qE '^\s*\[include\s+bt_config/bt_customize\.cfg\]' "$printer_cfg" 2>/dev/null && have_customize=1
-    grep -qE '^\[bbox_toolchanger\]' "$printer_cfg" 2>/dev/null && have_section=1
+    # `|| true` on each: under `set -e`, a bare `grep ... && var=1` statement
+    # (not part of an if/&&/! condition) would abort the whole script the
+    # moment the grep doesn't match - which is the common case (a fresh
+    # printer.cfg has none of these yet).
+    grep -qE '^\s*\[include\s+bbox_toolchanger/bt_base\.cfg\]' "$printer_cfg" 2>/dev/null && have_base=1 || true
+    grep -qE '^\s*\[include\s+bbox_toolchanger/bt_utils\.cfg\]' "$printer_cfg" 2>/dev/null && have_utils=1 || true
+    grep -qE '^\s*\[include\s+bt_config/bt_customize\.cfg\]' "$printer_cfg" 2>/dev/null && have_customize=1 || true
+    grep -qE '^\[bbox_toolchanger\]' "$printer_cfg" 2>/dev/null && have_section=1 || true
     local have_count=$((have_base + have_utils + have_customize + have_section))
 
     if [ "$have_count" -eq 4 ]; then
@@ -585,16 +603,16 @@ function offer_printer_cfg_patch {
     if [ "$have_count" -gt 0 ]; then
         echo "[PRINTER.CFG] $printer_cfg has some but not all required lines - leaving it alone to avoid duplicating anything."
         echo "[PRINTER.CFG] Missing:"
-        [ "$have_base" -eq 0 ] && echo "    [include bbox_toolchanger/bt_base.cfg]"
-        [ "$have_utils" -eq 0 ] && echo "    [include bbox_toolchanger/bt_utils.cfg]"
-        [ "$have_customize" -eq 0 ] && echo "    [include bt_config/bt_customize.cfg]"
-        [ "$have_section" -eq 0 ] && echo "    [bbox_toolchanger]"
+        [ "$have_base" -eq 0 ] && echo "    [include bbox_toolchanger/bt_base.cfg]" || true
+        [ "$have_utils" -eq 0 ] && echo "    [include bbox_toolchanger/bt_utils.cfg]" || true
+        [ "$have_customize" -eq 0 ] && echo "    [include bt_config/bt_customize.cfg]" || true
+        [ "$have_section" -eq 0 ] && echo "    [bbox_toolchanger]" || true
         echo ""
         return
     fi
 
     local has_save_config=false
-    grep -qE "$SAVE_CONFIG_MARKER_PATTERN" "$printer_cfg" 2>/dev/null && has_save_config=true
+    grep -qE "$SAVE_CONFIG_MARKER_PATTERN" "$printer_cfg" 2>/dev/null && has_save_config=true || true
 
     echo "[PRINTER.CFG] $printer_cfg is missing the BBox Toolchanger config block."
     if [ "$has_save_config" = true ]; then

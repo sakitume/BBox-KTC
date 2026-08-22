@@ -651,17 +651,14 @@ class ToolLogic:
         self.set_var('gate_temp',     gate_temp)
 
         # --- Tool offsets ---
-        # Stored as per-slot scalars bt_xoffset_N, bt_yoffset_N, bt_zoffset_N in save_variables.
-        # save_variables is the single source of truth; tools with no saved entry default to [0, 0, 0].
-        new_offsets = [[0.0, 0.0, 0.0] for _ in range(num_tools)]
-        for i in range(num_tools):
-            xkey, ykey, zkey = f'bt_xoffset_{i}', f'bt_yoffset_{i}', f'bt_zoffset_{i}'
-            if xkey in sv or ykey in sv or zkey in sv:
-                new_offsets[i] = [
-                    float(sv.get(xkey, 0.0)),
-                    float(sv.get(ykey, 0.0)),
-                    float(sv.get(zkey, 0.0)),
-                ]
+        # Stored per-tool as variable_tool_offset_N: [x, y, z] lines in bt_customize.cfg
+        # (bt_customize.cfg is the single source of truth). Migrate any legacy
+        # bt_xoffset_N/bt_yoffset_N/bt_zoffset_N values out of save_variables first,
+        # then read the (now up to date) per-tool config vars; tools with no entry
+        # default to [0, 0, 0].
+        self._migrate_tool_offsets_to_customize(sv, num_tools)
+        new_offsets = [list(self.get_var(f'tool_offset_{i}', [0.0, 0.0, 0.0]))
+                       for i in range(num_tools)]
         self.set_var('tool_offsets', new_offsets)
 
     # --- STATISTICS & LOGGING ---
@@ -706,6 +703,80 @@ class ToolLogic:
                 migrate_one(base, i)
 
         return migrated
+
+    def _migrate_tool_offsets_to_customize(self, sv, num_tools):
+        """One-time migration: copy any legacy bt_xoffset_N/bt_yoffset_N/
+        bt_zoffset_N save_variables scalars into bt_customize.cfg's new
+        variable_tool_offset_N triplets.
+
+        Skips a tool entirely if bt_customize.cfg's file content already has
+        a tool_offset_N line (never overwrite a value someone already moved
+        over or recalibrated) or if its legacy scalars are all exactly 0.0
+        (nothing meaningful to carry over). Deliberately checks the file
+        itself rather than get_var()/the live merged variable — tool_offset_N
+        is now pre-declared with a [0,0,0] default in bt_base.cfg (see
+        BT_SAVE_TOOL_OFFSET below for why), so get_var() would always see a
+        value and never signal "not yet migrated".
+
+        All migrated tools are batched into a single bt_customize.cfg
+        rewrite (one backup, not one per tool). Old bt_xoffset_N/etc. keys
+        are left in variables.cfg untouched; Klipper has no native "delete a
+        saved variable" command, same as the tc_* -> bt_* legacy migration
+        above.
+        """
+        if not any(f'bt_xoffset_{i}' in sv for i in range(num_tools)):
+            return
+
+        try:
+            path = self._bt_customize_path()
+            with open(path, 'r') as f:
+                existing_lines = f.readlines()
+        except Exception as e:
+            logging.exception("BBox tool-offset migration: couldn't read bt_customize.cfg")
+            self.gcode.respond_info(
+                f"[BBOX] WARNING: failed to migrate tool offsets into bt_customize.cfg: {e}")
+            return
+
+        def already_in_file(i):
+            key_re = re.compile(r'^\s*variable_tool_offset_%d\s*:' % i)
+            return any(key_re.match(l) for l in existing_lines if not l.lstrip().startswith('#'))
+
+        updates = {}
+        live = {}
+        for i in range(num_tools):
+            if already_in_file(i):
+                continue
+            x = round(float(sv.get(f'bt_xoffset_{i}', 0.0)), 4)
+            y = round(float(sv.get(f'bt_yoffset_{i}', 0.0)), 4)
+            z = round(float(sv.get(f'bt_zoffset_{i}', 0.0)), 4)
+            if x == 0.0 and y == 0.0 and z == 0.0:
+                continue
+            updates[f'tool_offset_{i}'] = "[%.4f, %.4f, %.4f]" % (x, y, z)
+            live[i] = [x, y, z]
+
+        if not updates:
+            return
+
+        try:
+            self._write_customize_updates(updates, insert_missing=True)
+        except Exception as e:
+            logging.exception("BBox tool-offset migration to bt_customize.cfg failed")
+            self.gcode.respond_info(
+                f"[BBOX] WARNING: failed to migrate tool offsets into bt_customize.cfg: {e}")
+            return
+
+        self.gcode.respond_info(
+            f"[BBOX] Migrated {len(updates)} legacy tool offset(s) from "
+            f"variables.cfg into bt_customize.cfg (backup taken).")
+        # Live push is best-effort — only tool_offset_0..7 are pre-declared in
+        # bt_base.cfg (SET_GCODE_VARIABLE can't create a new variable name),
+        # so a printer with more than 8 tools would just pick up the disk
+        # value (already safely written above) after the next RESTART.
+        for i, val in live.items():
+            try:
+                self.set_var(f'tool_offset_{i}', val)
+            except Exception:
+                logging.exception(f"BBox: couldn't live-update tool_offset_{i} after migration")
 
     def _get_saved_vars(self):
         """The 'Skeleton Key' that finally worked."""
@@ -1264,12 +1335,29 @@ class ToolLogic:
         except (TypeError, ValueError):
             toolhead.set_position(newpos, homing_axes=(0, 1, 2))
 
-    def _bt_customize_path(self):
-        """Path to the printer's bt_config/bt_customize.cfg, derived from the
-        running printer.cfg location (Klipper's start_args)."""
+    def _resolve_included_path(self, filename):
+        """Resolve `filename`'s real on-disk path by finding the [include ...]
+        line in printer.cfg whose basename matches it — so this follows
+        whatever printer.cfg actually has live (top-level, bt_config/, or
+        anywhere else), never a guessed fixed location. Raises a plain
+        Exception (caught by the proxy layer) if no matching include exists."""
         printer_cfg = self.printer.get_start_args()['config_file']
         config_dir = os.path.dirname(printer_cfg)
-        return os.path.join(config_dir, 'bt_config', 'bt_customize.cfg')
+        include_re = re.compile(r'^\s*\[include\s+(.+?)\s*\]\s*$')
+        with open(printer_cfg, 'r') as f:
+            for line in f:
+                m = include_re.match(line)
+                if not m:
+                    continue
+                inc_path = m.group(1)
+                if os.path.basename(inc_path) == filename:
+                    return os.path.normpath(os.path.join(config_dir, inc_path))
+        raise Exception(
+            f"No '[include ...{filename}]' line found in {printer_cfg} — "
+            f"add one before this command can locate/save {filename}.")
+
+    def _bt_customize_path(self):
+        return self._resolve_included_path('bt_customize.cfg')
 
     def _replace_customize_var(self, lines, var_name, new_value_str):
         """Replace the value on the last uncommented `variable_<var_name>:`
@@ -1301,13 +1389,46 @@ class ToolLogic:
         lines[last_idx] = new_line + newline
         return True
 
-    def _write_customize_updates(self, updates):
+    def _insert_customize_var(self, lines, var_name, value_str):
+        """Insert a new `variable_<var_name>: <value_str>` line into the
+        [gcode_macro _BT_VARIABLES] section of `lines` (a list of raw lines,
+        modified in place), directly after the last existing uncommented
+        `variable_*:` line in that section. Returns True on success, False
+        if the section (or any variable_* anchor line within it) wasn't
+        found — callers should treat False as a no-op, not a partial write."""
+        section_re = re.compile(r'^\s*\[gcode_macro _BT_VARIABLES\]\s*$')
+        var_re = re.compile(r'^\s*variable_\w+\s*:')
+        gcode_re = re.compile(r'^\s*gcode\s*:')
+        in_section = False
+        last_var_idx = None
+        for i, raw in enumerate(lines):
+            if section_re.match(raw):
+                in_section = True
+                continue
+            if not in_section:
+                continue
+            stripped = raw.lstrip()
+            if stripped.startswith('[') or gcode_re.match(raw):
+                break
+            if var_re.match(raw) and not stripped.startswith('#'):
+                last_var_idx = i
+        if last_var_idx is None:
+            return False
+        lines.insert(last_var_idx + 1, f"variable_{var_name}: {value_str}\n")
+        return True
+
+    def _write_customize_updates(self, updates, insert_missing=False):
         """Rewrite bt_customize.cfg with new values for the given
         {var_name: value_str} entries, replacing the last uncommented
-        `variable_<name>:` line for each. Backs up the original file first
-        and writes atomically. Returns the backup path. Raises a plain
-        Exception (caught by the proxy layer and reported to the console)
-        on any failure."""
+        `variable_<name>:` line for each. If `insert_missing` is True, a
+        variable with no existing line gets a new one inserted into the
+        [gcode_macro _BT_VARIABLES] section instead of erroring — used for
+        per-tool families (e.g. tool_offset_N) where the set of lines that
+        should exist grows with tool count, unlike fixed variables like
+        x_locs/dock_y which are always expected to already be declared.
+        Backs up the original file first and writes atomically. Returns the
+        backup path. Raises a plain Exception (caught by the proxy layer and
+        reported to the console) on any failure."""
         path = self._bt_customize_path()
         if not os.path.isfile(path):
             raise Exception(f"bt_customize.cfg not found at {path}")
@@ -1316,10 +1437,13 @@ class ToolLogic:
             lines = f.readlines()
 
         for var_name, value_str in updates.items():
-            if not self._replace_customize_var(lines, var_name, value_str):
-                raise Exception(
-                    f"No uncommented 'variable_{var_name}:' line found in {path}; "
-                    f"add one manually before calibrating.")
+            if self._replace_customize_var(lines, var_name, value_str):
+                continue
+            if insert_missing and self._insert_customize_var(lines, var_name, value_str):
+                continue
+            raise Exception(
+                f"No uncommented 'variable_{var_name}:' line found in {path}; "
+                f"add one manually before calibrating.")
 
         backup_path = f"{path}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
         shutil.copy2(path, backup_path)
@@ -1481,15 +1605,16 @@ class ToolLogic:
         z = gcmd.get_float('Z', existing_z)
         offsets[tool] = [round(x, 4), round(y, 4), round(z, 4)]
         self.set_var('tool_offsets', offsets)
-        self.gcode.run_script_from_command(
-            f'SAVE_VARIABLE VARIABLE=bt_xoffset_{tool} VALUE={round(x, 4)}'
-        )
-        self.gcode.run_script_from_command(
-            f'SAVE_VARIABLE VARIABLE=bt_yoffset_{tool} VALUE={round(y, 4)}'
-        )
-        self.gcode.run_script_from_command(
-            f'SAVE_VARIABLE VARIABLE=bt_zoffset_{tool} VALUE={round(z, 4)}'
-        )
+        try:
+            # Only tool_offset_0..15 are pre-declared in bt_base.cfg (SET_GCODE_VARIABLE
+            # can't create a new variable name) — best-effort so a tool index beyond that
+            # never blocks the disk write below, which is the actual persistence.
+            self.set_var(f'tool_offset_{tool}', offsets[tool])
+        except Exception:
+            logging.exception(f"BBox: couldn't live-update tool_offset_{tool}")
+        value_str = "[%.4f, %.4f, %.4f]" % tuple(offsets[tool])
+        self._write_customize_updates(
+            {f'tool_offset_{tool}': value_str}, insert_missing=True)
         gcmd.respond_info(f'Saved offset for T{tool}: X={x} Y={y} Z={z}')
 
         # If saving Z for the currently active tool, sync the live gcode Z offset
